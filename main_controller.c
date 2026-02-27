@@ -227,13 +227,17 @@ static void mcu_control_init(void)
 {
     for (int i = MCU_FIRST_CTRL; i < MCU_TOTAL; i++)
     {
+        // 先写默认电平，再切换为输出，避免方向切换瞬间产生毛刺
         gpio_reset_pin(boot_pins[i]);
-        gpio_set_direction(boot_pins[i], GPIO_MODE_OUTPUT);
         gpio_set_level(boot_pins[i], 0);
+        gpio_set_pull_mode(boot_pins[i], GPIO_PULLDOWN_ONLY);
+        gpio_set_direction(boot_pins[i], GPIO_MODE_OUTPUT);
 
+        // RESET为低有效：上电阶段优先保持高电平，避免从MCU被误复位
         gpio_reset_pin(reset_pins[i]);
-        gpio_set_direction(reset_pins[i], GPIO_MODE_OUTPUT);
         gpio_set_level(reset_pins[i], 1);
+        gpio_set_pull_mode(reset_pins[i], GPIO_PULLUP_ONLY);
+        gpio_set_direction(reset_pins[i], GPIO_MODE_OUTPUT);
     }
 
     ESP_LOGI(TAG, "MCU控制引脚初始化完成（MCU3~MCU8）");
@@ -359,8 +363,18 @@ static esp_err_t can_init(void)
  *        data[0] = mcu_status (从MCU蓝牙状态)
  *        data[1] = system_enabled (系统使能状态)
  */
-static void can_send_status(void)
+static esp_err_t can_send_status(void)
 {
+    static uint32_t tx_fail_count = 0;
+
+    twai_status_info_t can_status;
+    if (twai_get_status_info(&can_status) == ESP_OK && can_status.state == TWAI_STATE_BUS_OFF)
+    {
+        ESP_LOGE(TAG, "CAN总线BUS-OFF，无法发送状态，尝试恢复");
+        twai_initiate_recovery();
+        return ESP_ERR_INVALID_STATE;
+    }
+
     twai_message_t tx_msg = {
         .identifier = CAN_ID_STATUS,
         .data_length_code = 2,
@@ -370,13 +384,20 @@ static void can_send_status(void)
     esp_err_t ret = twai_transmit(&tx_msg, pdMS_TO_TICKS(100));
     if (ret == ESP_OK)
     {
+        tx_fail_count = 0;
         ESP_LOGD(TAG, "状态发送: mcu=0x%02X, sys=%s", 
                  mcu_status, system_enabled ? "ON" : "OFF");
     }
     else
     {
-        ESP_LOGW(TAG, "状态发送失败: %s", esp_err_to_name(ret));
+        tx_fail_count++;
+        if (tx_fail_count == 1 || (tx_fail_count % 6) == 0)
+        {
+            ESP_LOGW(TAG, "状态发送失败(%lu): %s", (unsigned long)tx_fail_count, esp_err_to_name(ret));
+        }
     }
+
+    return ret;
 }
 
 static void can_process_command(const twai_message_t *msg)
@@ -478,7 +499,12 @@ static void status_monitor_task(void *arg)
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(5000));
-        can_send_status();
+
+        if (system_enabled)
+        {
+            can_send_status();
+        }
+
         ESP_LOGI(TAG, "状态: sys=%s, mcu=0x%02X", 
                  system_enabled ? "ON" : "OFF", mcu_status);
     }
@@ -509,6 +535,14 @@ void app_main(void)
 
     // 初始化按键
     button_init();
+
+    // 启动后打印BOOT_MAIN电平，辅助判断GPIO0是否被外部电路持续拉低
+    int boot_level = gpio_get_level(BOOT_MAIN);
+    ESP_LOGI(TAG, "BOOT_MAIN当前电平: %d (0=按下/被拉低, 1=释放)", boot_level);
+    if (boot_level == 0)
+    {
+        ESP_LOGW(TAG, "检测到GPIO0为低电平：可能影响正常启动，请检查外部上拉与按键电路");
+    }
 
     // 初始化MCU控制引脚
     mcu_control_init();
