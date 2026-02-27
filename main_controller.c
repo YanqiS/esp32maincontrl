@@ -227,13 +227,17 @@ static void mcu_control_init(void)
 {
     for (int i = MCU_FIRST_CTRL; i < MCU_TOTAL; i++)
     {
+        // 先写默认电平，再切换为输出，避免方向切换瞬间产生毛刺
         gpio_reset_pin(boot_pins[i]);
-        gpio_set_direction(boot_pins[i], GPIO_MODE_OUTPUT);
         gpio_set_level(boot_pins[i], 0);
+        gpio_set_pull_mode(boot_pins[i], GPIO_PULLDOWN_ONLY);
+        gpio_set_direction(boot_pins[i], GPIO_MODE_OUTPUT);
 
+        // RESET为低有效：上电阶段优先保持高电平，避免从MCU被误复位
         gpio_reset_pin(reset_pins[i]);
-        gpio_set_direction(reset_pins[i], GPIO_MODE_OUTPUT);
         gpio_set_level(reset_pins[i], 1);
+        gpio_set_pull_mode(reset_pins[i], GPIO_PULLUP_ONLY);
+        gpio_set_direction(reset_pins[i], GPIO_MODE_OUTPUT);
     }
 
     ESP_LOGI(TAG, "MCU控制引脚初始化完成（MCU3~MCU8）");
@@ -509,6 +513,14 @@ void app_main(void)
 
     // 初始化按键
     button_init();
+
+    // 启动后打印BOOT_MAIN电平，辅助判断GPIO0是否被外部电路持续拉低
+    int boot_level = gpio_get_level(BOOT_MAIN);
+    ESP_LOGI(TAG, "BOOT_MAIN当前电平: %d (0=按下/被拉低, 1=释放)", boot_level);
+    if (boot_level == 0)
+    {
+        ESP_LOGW(TAG, "检测到GPIO0为低电平：可能影响正常启动，请检查外部上拉与按键电路");
+    }
 
     // 初始化MCU控制引脚
     mcu_control_init();
