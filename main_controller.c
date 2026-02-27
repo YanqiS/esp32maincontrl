@@ -363,8 +363,18 @@ static esp_err_t can_init(void)
  *        data[0] = mcu_status (从MCU蓝牙状态)
  *        data[1] = system_enabled (系统使能状态)
  */
-static void can_send_status(void)
+static esp_err_t can_send_status(void)
 {
+    static uint32_t tx_fail_count = 0;
+
+    twai_status_info_t can_status;
+    if (twai_get_status_info(&can_status) == ESP_OK && can_status.state == TWAI_STATE_BUS_OFF)
+    {
+        ESP_LOGE(TAG, "CAN总线BUS-OFF，无法发送状态，尝试恢复");
+        twai_initiate_recovery();
+        return ESP_ERR_INVALID_STATE;
+    }
+
     twai_message_t tx_msg = {
         .identifier = CAN_ID_STATUS,
         .data_length_code = 2,
@@ -374,13 +384,20 @@ static void can_send_status(void)
     esp_err_t ret = twai_transmit(&tx_msg, pdMS_TO_TICKS(100));
     if (ret == ESP_OK)
     {
+        tx_fail_count = 0;
         ESP_LOGD(TAG, "状态发送: mcu=0x%02X, sys=%s", 
                  mcu_status, system_enabled ? "ON" : "OFF");
     }
     else
     {
-        ESP_LOGW(TAG, "状态发送失败: %s", esp_err_to_name(ret));
+        tx_fail_count++;
+        if (tx_fail_count == 1 || (tx_fail_count % 6) == 0)
+        {
+            ESP_LOGW(TAG, "状态发送失败(%lu): %s", (unsigned long)tx_fail_count, esp_err_to_name(ret));
+        }
     }
+
+    return ret;
 }
 
 static void can_process_command(const twai_message_t *msg)
@@ -482,7 +499,12 @@ static void status_monitor_task(void *arg)
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(5000));
-        can_send_status();
+
+        if (system_enabled)
+        {
+            can_send_status();
+        }
+
         ESP_LOGI(TAG, "状态: sys=%s, mcu=0x%02X", 
                  system_enabled ? "ON" : "OFF", mcu_status);
     }
